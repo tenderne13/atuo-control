@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import ctypes
+from ctypes import wintypes
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -18,8 +19,17 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+VK_S = 0x53
+VK_X = 0x58
+HOTKEY_START_ID = 1
+HOTKEY_STOP_ID = 2
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 @dataclass
@@ -106,6 +116,10 @@ class AutoClickApp:
 
         self.stop_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
+        self.hotkeys_registered = False
+        self.hotkey_thread: threading.Thread | None = None
+        self.hotkey_thread_id: int | None = None
+        self.hotkey_stop_event = threading.Event()
 
         self.config_data = load_config()
 
@@ -117,9 +131,12 @@ class AutoClickApp:
         self.loop_forever_var = tk.BooleanVar(value=self.config_data["loop_forever"])
         self.loop_count_var = tk.StringVar(value=str(self.config_data["loop_count"]))
         self.startup_delay_var = tk.StringVar(value=str(self.config_data["startup_delay_ms"]))
+        self.status_var = tk.StringVar(value="准备就绪")
 
         self._build_ui()
         self._load_steps()
+        self._bind_shortcuts()
+        self._start_hotkey_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self) -> None:
@@ -148,13 +165,20 @@ class AutoClickApp:
         ttk.Label(loop_frame, text="循环次数").pack(side="left", padx=(16, 6))
         self.loop_count_entry = ttk.Entry(loop_frame, textvariable=self.loop_count_var, width=8)
         self.loop_count_entry.pack(side="left")
+        ttk.Label(loop_frame, text="快捷键：Ctrl+Shift+S 开始，Ctrl+Shift+X 停止").pack(side="right")
 
         actions = ttk.Frame(main, padding=(0, 0, 0, 10))
         actions.pack(fill="x")
         ttk.Button(actions, text="保存配置", command=self.save_current_config).pack(side="left")
         ttk.Button(actions, text="测试单次", command=self.run_once).pack(side="left", padx=8)
-        ttk.Button(actions, text="开始循环", command=self.start_loop).pack(side="left")
-        ttk.Button(actions, text="停止", command=self.stop_loop).pack(side="left", padx=8)
+        ttk.Button(actions, text="开始循环 (Ctrl+Shift+S)", command=self.start_loop).pack(side="left")
+        ttk.Button(actions, text="停止 (Ctrl+Shift+X)", command=self.stop_loop).pack(side="left", padx=8)
+
+        status_frame = ttk.Frame(main, padding=(0, 0, 0, 10))
+        status_frame.pack(fill="x")
+        ttk.Label(status_frame, text="当前状态：").pack(side="left")
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground="#0f766e")
+        self.status_label.pack(side="left")
 
         step_frame = ttk.LabelFrame(main, text="点击步骤", padding=12)
         step_frame.pack(fill="both", expand=True)
@@ -247,6 +271,67 @@ class AutoClickApp:
         state = "disabled" if self.loop_forever_var.get() else "normal"
         self.loop_count_entry.configure(state=state)
 
+    def _bind_shortcuts(self) -> None:
+        return
+
+    def _on_start_shortcut(self, _event=None) -> str:
+        self.start_loop()
+        return "break"
+
+    def _on_stop_shortcut(self, _event=None) -> str:
+        self.stop_loop()
+        return "break"
+
+    def set_status(self, message: str, color: str = "#0f766e") -> None:
+        def update() -> None:
+            self.status_var.set(message)
+            self.status_label.configure(foreground=color)
+
+        self.root.after(0, update)
+
+    def _register_global_hotkeys(self) -> None:
+        start_ok = user32.RegisterHotKey(None, HOTKEY_START_ID, MOD_CONTROL | MOD_SHIFT, VK_S)
+        stop_ok = user32.RegisterHotKey(None, HOTKEY_STOP_ID, MOD_CONTROL | MOD_SHIFT, VK_X)
+
+        if not start_ok or not stop_ok:
+            self._unregister_global_hotkeys()
+            self.set_status("全局快捷键注册失败，请检查是否被其他程序占用", "#b91c1c")
+            self.log("全局快捷键注册失败，Ctrl+Shift+S 或 Ctrl+Shift+X 可能已被占用")
+            return
+
+        self.hotkeys_registered = True
+        self.log("全局快捷键已生效：Ctrl+Shift+S 开始，Ctrl+Shift+X 停止")
+
+    def _unregister_global_hotkeys(self) -> None:
+        user32.UnregisterHotKey(None, HOTKEY_START_ID)
+        user32.UnregisterHotKey(None, HOTKEY_STOP_ID)
+        self.hotkeys_registered = False
+
+    def _start_hotkey_listener(self) -> None:
+        self.hotkey_stop_event.clear()
+        self.hotkey_thread = threading.Thread(target=self._hotkey_listener_loop, daemon=True)
+        self.hotkey_thread.start()
+
+    def _hotkey_listener_loop(self) -> None:
+        self.hotkey_thread_id = kernel32.GetCurrentThreadId()
+        self._register_global_hotkeys()
+        if not self.hotkeys_registered:
+            return
+
+        msg = wintypes.MSG()
+        while not self.hotkey_stop_event.is_set():
+            result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if result <= 0:
+                break
+            if msg.message == WM_HOTKEY:
+                if int(msg.wParam) == HOTKEY_START_ID:
+                    self.root.after(0, self.start_loop)
+                elif int(msg.wParam) == HOTKEY_STOP_ID:
+                    self.root.after(0, self.stop_loop)
+
+        self._unregister_global_hotkeys()
+        self.hotkey_thread_id = None
+
     def log(self, message: str) -> None:
         def write() -> None:
             now = time.strftime("%H:%M:%S")
@@ -303,6 +388,7 @@ class AutoClickApp:
             return
 
         self.log("配置已保存到 config.json")
+        self.set_status("配置已保存，可以开始执行", "#2563eb")
 
     def add_step(self) -> None:
         try:
@@ -363,21 +449,27 @@ class AutoClickApp:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("提示", "当前已有任务在运行")
             return
-        self._start_worker(single_run=True)
+        if self._start_worker(single_run=True):
+            self.set_status("开始执行单次测试，请稍候", "#2563eb")
+            self.log("单次测试已启动")
 
     def start_loop(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("提示", "循环已在运行中")
+            self.set_status("循环已经在运行中了", "#b45309")
             return
-        self._start_worker(single_run=False)
+        if self._start_worker(single_run=False):
+            self.set_status("循环已启动，按 Ctrl+Shift+X 可随时停止", "#2563eb")
+            self.log("循环已启动，可按 Ctrl+Shift+X 停止")
 
-    def _start_worker(self, single_run: bool) -> None:
+    def _start_worker(self, single_run: bool) -> bool:
         try:
             self.config_data = self.collect_config()
             save_config(self.config_data)
         except ValueError as exc:
             messagebox.showerror("配置错误", str(exc))
-            return
+            self.set_status(f"启动失败：{exc}", "#b91c1c")
+            return False
 
         self.stop_event.clear()
         self.worker_thread = threading.Thread(
@@ -386,9 +478,16 @@ class AutoClickApp:
             daemon=True,
         )
         self.worker_thread.start()
+        return True
 
     def stop_loop(self) -> None:
+        if not self.worker_thread or not self.worker_thread.is_alive():
+            self.set_status("当前没有正在运行的任务", "#b45309")
+            self.log("收到停止指令，但当前没有运行中的任务")
+            return
+
         self.stop_event.set()
+        self.set_status("已发送停止指令，当前步骤结束后会退出", "#b45309")
         self.log("已请求停止，当前步骤结束后会退出")
 
     def _execute_flow(self, config: dict, single_run: bool) -> None:
@@ -412,10 +511,13 @@ class AutoClickApp:
                     break
 
             if self.stop_event.is_set():
+                self.set_status("任务已停止，随时可以重新开始", "#b45309")
                 self.log("任务已停止")
             else:
+                self.set_status("任务执行完成", "#0f766e")
                 self.log("任务执行完成")
         except Exception as exc:  # noqa: BLE001
+            self.set_status(f"运行失败：{exc}", "#b91c1c")
             self.log(f"运行失败：{exc}")
             self.root.after(0, lambda: messagebox.showerror("运行失败", str(exc)))
 
@@ -465,6 +567,9 @@ class AutoClickApp:
 
     def on_close(self) -> None:
         self.stop_event.set()
+        self.hotkey_stop_event.set()
+        if self.hotkey_thread_id:
+            user32.PostThreadMessageW(self.hotkey_thread_id, WM_QUIT, 0, 0)
         self.root.destroy()
 
 

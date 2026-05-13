@@ -40,6 +40,33 @@ python app.py
 - 程序保存的 `config.json` 会放在 exe 所在目录，方便长期使用和迁移。
 - 如果你后面把 exe 单独拷到别的目录，配置文件也会跟着在那个目录生成。
 
+## 如何自己打包
+
+如果你后面修改了代码，可以按下面步骤重新打包：
+
+1. 安装 PyInstaller
+
+```powershell
+python -m pip install pyinstaller
+```
+
+2. 在项目根目录执行打包命令
+
+```powershell
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name auto-control app.py
+```
+
+3. 打包完成后，到下面这个目录拿程序
+
+`dist/auto-control.exe`
+
+补充说明：
+
+- `--onefile` 表示打成单文件 exe。
+- `--windowed` 表示运行时不弹黑色控制台窗口。
+- `--clean` 会清理旧的打包缓存，减少旧文件干扰。
+- 如果你只是重新打包当前版本，直接重复执行上面的命令就可以。
+
 ## 默认步骤
 
 默认已经预置你提供的三步：
